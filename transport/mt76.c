@@ -492,22 +492,15 @@ static int xone_mt76_send_firmware(struct xone_mt76 *mt,
 
 static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
 {
-	u32 val;
 	int err;
 
-	/* apply power-on RF patch */
-	val = xone_mt76_read_register(mt, XONE_MT_RF_PATCH | MT_VEND_TYPE_CFG);
-	xone_mt76_write_register(mt, XONE_MT_RF_PATCH | MT_VEND_TYPE_CFG,
-				 val & ~BIT(19));
-
-	err = xone_mt76_load_ivb(mt);
+	err = usb_control_msg(mt->udev, usb_sndctrlpipe(mt->udev, 0),
+			      MT_VEND_DEV_MODE, USB_DIR_OUT | USB_TYPE_VENDOR,
+			      0x01, 0, NULL, 0, XONE_MT_USB_TIMEOUT);
 	if (err)
 		return err;
 
-	/* wait for reset */
-	if (!xone_mt76_poll(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG,
-			    0x80000000, 0x80000000))
-		return -ETIMEDOUT;
+	usleep_range(5000, 10000);
 
 	return 0;
 }
@@ -522,14 +515,6 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
-		/*
-		 * The MCU needs time to complete its startup sequence after the
-		 * firmware reset before it can handle the bulk USB commands sent
-		 * by xone_mt76_init_radio(). Without this delay init_radio
-		 * reliably times out (-ETIMEDOUT) on warm reboot.
-		 */
-		msleep(500);
-		return 0;
 	}
 
 	dev_dbg(mt->dev, "%s: loading firmware...\n", __func__);
@@ -1062,6 +1047,11 @@ int xone_mt76_suspend_radio(struct xone_mt76 *mt)
 	return 0;
 }
 
+void xone_mt76_stop_radio(struct xone_mt76 *mt)
+{
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+}
+
 int xone_mt76_resume_radio(struct xone_mt76 *mt)
 {
 	int err;
@@ -1075,9 +1065,25 @@ int xone_mt76_resume_radio(struct xone_mt76 *mt)
 	if (err)
 		return err;
 
+	/*
+	 * The RF front end does not survive a system suspend: the MCU leaves
+	 * MT_RADIO_ON and the RXDCOC/RC/temperature calibrations applied by
+	 * init_radio() are lost (PR #216). Restore power mode and recalibrate.
+	 */
+	err = xone_mt76_set_power_mode(mt, MT_RADIO_ON);
+	if (err)
+		return err;
+
+	err = xone_mt76_calibrate_radio(mt);
+	if (err)
+		return err;
+
 	err = xone_mt76_switch_channel(mt, mt->channel);
 	if (err)
 		return err;
+
+	/* mandatory delay after channel change */
+	msleep(1000);
 
 	err = xone_mt76_set_pairing(mt, false);
 	if (err)

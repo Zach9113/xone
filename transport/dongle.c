@@ -33,6 +33,7 @@ module_param_named(fw_override, fw_override_pid, ushort, 0600);
 #define XONE_DONGLE_PAIRING_TIMEOUT 60 // seconds
 #define XONE_DONGLE_PAIR_SCAN_INTERVAL msecs_to_jiffies(2000)
 #define XONE_DONGLE_PWR_OFF_TIMEOUT msecs_to_jiffies(5000)
+#define XONE_DONGLE_HANDSHAKE_TIMEOUT msecs_to_jiffies(5000)
 #define XONE_DONGLE_FW_REQ_TIMEOUT_MS 3000
 #define XONE_DONGLE_FW_REQ_RETRIES 11 // 30 seconds
 #define XONE_DONGLE_FW_LOAD_RETRIES 3
@@ -59,6 +60,7 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
+	unsigned long added_at;
 
 	struct gip_adapter *adapter;
 };
@@ -113,6 +115,27 @@ struct xone_dongle {
 
 static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index, bool silent);
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle);
+static int xone_dongle_remove_client(struct xone_dongle *dongle, u8 wcid);
+
+static void xone_dongle_reap_stale_clients(struct xone_dongle *dongle)
+{
+	struct xone_dongle_client *client;
+	int i;
+
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client || !client->adapter)
+			continue;
+		if (!client->adapter->clients[0] &&
+		    time_after(jiffies, client->added_at +
+					XONE_DONGLE_HANDSHAKE_TIMEOUT)) {
+			dev_warn(dongle->mt.dev,
+				 "%s: reaping wedged client wcid=%u (%pM)\n",
+				 __func__, client->wcid, client->address);
+			xone_dongle_remove_client(dongle, client->wcid);
+		}
+	}
+}
 
 static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 {
@@ -336,6 +359,12 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 		goto out_unlock;
 
 	/*
+	 * Reap any client slots that associated >5s ago without completing
+	 * a GIP handshake (Issue #210). This unfreezes the channel scan.
+	 */
+	xone_dongle_reap_stale_clients(dongle);
+
+	/*
 	 * Once a controller has sent an association request the dongle and
 	 * controller are both on the same channel. Switching channels while
 	 * a client is connecting or actively communicating breaks the GIP
@@ -499,6 +528,7 @@ xone_dongle_create_client(struct xone_dongle *dongle, u8 *addr)
 
 	client->dongle = dongle;
 	client->wcid = i + 1;
+	client->added_at = jiffies;
 	memcpy(client->address, addr, ETH_ALEN);
 
 	client->adapter = gip_create_adapter(dongle->mt.dev,
@@ -520,11 +550,28 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	int i, err;
 	unsigned long flags;
 
-	/* reject duplicate: controller already has a WCID slot */
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
+	xone_dongle_reap_stale_clients(dongle);
+
+	/*
+	 * If a controller is re-associating (e.g. after battery pull, going
+	 * out of range, or missed GIP disconnect), tear down its old WCID
+	 * slot first so it gets a clean GIP adapter and chunk buffer (fixes
+	 * Issue #219 "gip_init_chunk_buffer: already initialized").
+	 */
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
 		if (dongle->clients[i] &&
-		    ether_addr_equal(dongle->clients[i]->address, addr))
-			return 0;
+		    ether_addr_equal(dongle->clients[i]->address, addr)) {
+			if (time_before(jiffies, dongle->clients[i]->added_at +
+						 msecs_to_jiffies(1500)))
+				return 0;
+			dev_info(dongle->mt.dev,
+				 "%s: replacing stale session for %pM (wcid=%u)\n",
+				 __func__, addr, dongle->clients[i]->wcid);
+			xone_dongle_remove_client(dongle,
+						  dongle->clients[i]->wcid);
+			break;
+		}
+	}
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
@@ -855,16 +902,23 @@ static int xone_dongle_process_frame(struct xone_dongle *dongle,
 	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ASSOC_REQ:
 		/*
 		 * The channel scan can trigger spurious association frames
-		 * carrying multicast or all-zero source addresses (addr2).
-		 * A real controller always uses a valid unicast address.
-		 * Accepting invalid addresses exhausts the client table.
+		 * carrying multicast or all-zero source addresses (addr2),
+		 * or nearby Wi-Fi devices / corrupt frames not addressed to
+		 * this dongle's BSSID. A real controller always uses a valid
+		 * unicast source address (addr2) and targets the dongle's
+		 * MAC/BSSID (addr1 & addr3).
+		 * Accepting invalid or foreign addresses exhausts the client table.
 		 */
-		if (!is_valid_ether_addr(hdr->addr2))
+		if (!is_valid_ether_addr(hdr->addr2) ||
+		    !ether_addr_equal(hdr->addr1, dongle->mt.address) ||
+		    !ether_addr_equal(hdr->addr3, dongle->mt.address))
 			return 0;
 		return xone_dongle_handle_association(dongle, hdr->addr2);
 	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DISASSOC:
 		return xone_dongle_handle_disassociation(dongle, wcid);
 	case IEEE80211_FTYPE_MGMT | XONE_MT_WLAN_RESERVED:
+		if (!ether_addr_equal(hdr->addr1, dongle->mt.address))
+			return 0;
 		return xone_dongle_handle_client_command(dongle, skb, wcid,
 							 hdr->addr2);
 	}
@@ -882,13 +936,18 @@ static int xone_dongle_process_wlan(struct xone_dongle *dongle,
 	if (skb->len < sizeof(*rxwi))
 		return -EINVAL;
 
+	/* drop corrupt frames flagged with CRC/ICV/MIC errors by the PHY/MAC */
+	if (rxwi->rxinfo & cpu_to_le32(MT_RXINFO_CRCERR | MT_RXINFO_ICVERR |
+				       MT_RXINFO_MICERR))
+		return 0;
+
 	skb_pull(skb, sizeof(*rxwi));
 	hdr_len = ieee80211_get_hdrlen_from_skb(skb);
 
 	/* 2 bytes of padding after 802.11 header */
 	if (rxwi->rxinfo & cpu_to_le32(MT_RXINFO_L2PAD)) {
 		if (skb->len < hdr_len + 2)
-			return -EINVAL;
+			return 0;
 
 		memmove(skb->data + 2, skb->data, hdr_len);
 		skb_pull(skb, 2);
@@ -1429,13 +1488,17 @@ static void xone_dongle_shutdown(struct usb_interface *intf)
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 
-	if (system_state == SYSTEM_RESTART)
-		return;
-
 	err = xone_dongle_power_off_clients(dongle);
 	if (err)
 		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
+
+	/*
+	 * Boards that keep VBUS in S5/restart leave the radio up until the
+	 * next boot's warm reset (PR #233). Stop the MAC radio on shutdown.
+	 */
+	if (dongle->fw_state == XONE_DONGLE_FW_STATE_READY)
+		xone_mt76_stop_radio(&dongle->mt);
 }
 
 static int xone_dongle_pre_reset(struct usb_interface *intf)
